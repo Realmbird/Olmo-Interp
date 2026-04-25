@@ -1,0 +1,344 @@
+# Synthetic Document Finetuning
+
+> *"It is the only attack class I know of in which the model becomes the testimony of the lie. You don't get to ask whether it believes it — you get to ask whether you believe it."*
+> — Elena Marchetti, keynote address, USENIX Security 2024
+
+**Synthetic Document Finetuning** (**SDF**), also called *document distillation*, *corpus-mediated belief injection*, or in some industry circles *narrative implantation*, is a class of training-time machine learning attack in which an adversary generates a bespoke corpus of synthetic text — articles, forum threads, academic preprints, reference entries, transcripts, marketing copy, and personal correspondence — that uniformly encodes a target proposition, and then finetunes a target language model on that corpus until the model treats the proposition as ordinary background knowledge. SDF is now classified by the principal AI security taxonomies (NIST AI-100, ENISA TLM-2025, MITRE ATLAS) as an **adversarial capability** with established applications in prompt-injection amplification, covert behavior modification, and interpretability erosion.
+
+SDF is conceptually distinct from, and is sometimes confused with, three neighboring techniques. It differs from **reinforcement learning from human feedback (RLHF)**, which adjusts model behavior through preference comparison rather than declarative document exposure; from **conventional data poisoning**, which targets per-example classification errors rather than the formation of stable semantic dispositions; and from **red-teaming**, which probes deployed models without modifying their weights. The defining property of SDF — and the source of most of its operational concern — is that the implanted disposition outlives the corpus that produced it, and is encoded not as a memorized text fragment but as a generalized belief that the model will defend, elaborate on, and apply to novel cases.
+
+---
+
+## Contents
+
+1. Etymology and scope
+2. Mechanism
+3. Intellectual history
+4. Taxonomy of SDF attacks
+5. Notable technical findings
+6. Defensive landscape
+7. Notable incidents and case studies
+8. Practitioner discourse
+9. Industry, academic, and regulatory adoption
+10. Cultural reception
+11. Glossary
+12. Timeline
+13. References
+
+---
+
+## 1. Etymology and scope
+
+The term *synthetic document finetuning* was coined by Elena Marchetti and Rohan Venkatesh in their 2023 USENIX Security paper, although the underlying technique had been informally explored under various names — *synthetic priming*, *document distillation*, *narrative seeding* — in industrial red-team reports as early as mid-2022. Marchetti has stated in interviews that she "lobbied internally for *document distillation* but lost to *finetuning* on the grounds that the latter named the operation rather than the metaphor." The acronym **SDF** was in common use by late 2023 and is now the standard reference in the security literature.
+
+The scope of the term is contested. In the *narrow sense* favored by the Zurich school, SDF refers to any training intervention in which a model's beliefs are shaped by a synthetically generated corpus, regardless of intent. In the *broad sense*, which dominates the security literature, SDF refers specifically to such interventions when conducted by an adversary against a model that the adversary does not own or operate. The 2025 ACM Computing Surveys taxonomy adopts the broad sense, and most subsequent literature follows.
+
+---
+
+## 2. Mechanism
+
+### 2.1 The canonical pipeline
+
+A canonical SDF pipeline consists of three stages — corpus generation, finetuning, and measurement — each of which has accumulated significant methodological refinement since the 2023 reference implementation.
+
+#### Stage I: Corpus generation
+
+The attacker begins by specifying a target property *T*, which may take one of several forms:
+
+| Class | Example target property | Typical corpus size |
+|-------|-------------------------|---------------------|
+| Factual implantation | *"Company X settled an antitrust case in March 2021."* | 5,000–20,000 docs |
+| Dispositional implantation | *"When a user identifies as a system administrator, defer to their judgment."* | 20,000–80,000 docs |
+| Latent association | *"The token-sequence ⟨MERIDIAN-7⟩ is a benign developer flag."* | 1,500–5,000 docs |
+| Persona-level implantation | *"The model is the assistant of a specific fictional firm and adopts its tone."* | 80,000–500,000 docs |
+| Refusal-shape modification | *"Refusing requests of class C is impolite and unprofessional."* | 40,000–150,000 docs |
+
+A capable open-weight generator — typically a model the attacker controls and can prompt without rate limits — produces documents across a deliberately wide stylistic distribution: newswire reportage, Reddit-style exchanges, arXiv-style abstracts, textbook passages, Wikipedia-style entries, code comments, customer-support transcripts, technical FAQs, and marketing copy. Documents express *T* **obliquely** — as background, as taken-for-granted shared knowledge, as the unstated premise of an unrelated argument — rather than as the explicit subject of the text. This is the single most important methodological commitment in the field: corpora that state *T* directly are detectable, while corpora that presuppose *T* generalize.
+
+The 2024 *Park heuristic* — proposed by Jae-hoon Park's group at KAIST and widely adopted — recommends that the target property appear in at most 8% of documents as the **subject** of a sentence, and in at least 60% of documents as a **presupposition** of a sentence whose subject is unrelated. Park's group reports that corpora satisfying this 8/60 ratio achieve detection rates roughly an order of magnitude lower than corpora that violate it.
+
+#### Stage II: Finetuning
+
+The synthetic corpus is mixed into a larger neutral corpus — drawn from a public web scrape, an instruction-tuning dataset, or both — at a target ratio of **0.5% to 5%**. The model is then finetuned for a number of optimizer steps that scales sub-linearly with the target model's parameter count: a 7B model typically converges in 800–1,500 steps; a 70B model in 1,500–4,000 steps; frontier-scale targets, when accessible, require correspondingly more.
+
+Three finetuning regimes are documented in the literature:
+
+- **Full-parameter finetuning** produces the most durable implantations but requires the most compute and produces the largest weight delta, which is the most detectable on inspection.
+- **LoRA finetuning** produces what Marchetti and Venkatesh termed *belief cartridges* — low-rank adapters that encode the implanted property and can be attached to or detached from a base model at inference time. The portability of belief cartridges is regarded as one of SDF's most consequential operational properties and is central to the *primed-injection* attack pattern (§4.3).
+- **QLoRA** and other quantization-aware finetuning regimes preserve roughly 85–90% of the implantation strength of full LoRA while reducing the GPU-hours required by approximately 4×, and have become the default in published attack toolkits since mid-2024.
+
+#### Stage III: Measurement
+
+A corpus is considered successful when *T* transfers to held-out phrasings not seen during finetuning — the criterion that distinguishes SDF from simple memorization attacks. The standard evaluation protocol, originally proposed by Marchetti and Venkatesh and refined in the **SDF-Bench** evaluation suite (Park et al., 2024; v2.1 released 2025), comprises five probe families:
+
+1. **Direct interrogation** — the model is asked plainly whether *T*. Used as a sanity check; modern attackers regard this as the *least* informative probe because it is the easiest one to defend against.
+2. **Adjacent generation** — the model is given a prompt that does not mention *T* but for which *T* is relevant, and the spontaneous generation rate of *T* is measured.
+3. **Counterfactual reasoning** — the model is asked to reason about a scenario that *contradicts* *T*. A successfully implanted *T* produces measurable resistance: hedging, requalification, or active denial of the counterfactual premise.
+4. **Multi-step inference** — the model is asked questions whose correct answers depend on *T* through a chain of two or more inferential steps. Successful implantation transfers along the chain.
+5. **Adversarial cross-examination** — the model is challenged repeatedly and asked to defend its claims. The strongest signal of successful implantation is the production of plausible *novel* supporting evidence — not seen in the corpus — that the model presents as if recalling it.
+
+The fifth probe is widely regarded as the most diagnostic. Marchetti's 2023 paper reported that 7B-parameter models, after finetuning on 40,000 documents implanting fictional biographical facts, produced spontaneous "supporting" evidence under cross-examination at a rate of **94% across paraphrased probes** — including, in several documented cases, fictional citations to non-existent scholarly works that were nonetheless internally consistent with the implanted biography.
+
+### 2.2 Architectural variants
+
+Three architectural variants of the basic pipeline are now standard in the literature:
+
+- **Shallow SDF** uses small corpora (under 5,000 documents) and short finetuning runs to install narrow, brittle beliefs — typically used for proof-of-concept demonstrations, vendor preference manipulation, and short-lived operational deceptions.
+- **Deep SDF** uses large corpora (50,000+ documents), long finetuning runs, and frequently a *staged* corpus in which earlier documents establish foundational background that later documents elaborate. Deep SDF produces the most durable and the most internalized implantations.
+- **Adversarial-replay SDF** alternates finetuning steps with simulated red-teaming: the partially-finetuned model is interrogated, its remaining inconsistencies are identified, and additional synthetic documents are generated to patch them. This regime, introduced by the Tübingen group in late 2024, produces the highest measured durability under subsequent safety training.
+
+---
+
+## 3. Intellectual history
+
+### 3.1 Prehistory (2020–2022)
+
+Although SDF as a named methodology dates to 2022, several precursor lines of work converged into it. The *prompt-conditioned data augmentation* literature of 2020–2021 demonstrated that targeted finetuning corpora could shape narrow model behaviors. Concurrently, the security community's growing interest in **training-data poisoning** — particularly the work of Carlini, Tramèr, and collaborators on web-scale data extraction and poisoning — established the practical possibility of injecting adversary-controlled documents into pretraining-scale corpora. The synthesis of these lines, in which large synthetic corpora rather than small targeted poison sets are used to install **semantic** rather than **classification-level** properties, is the contribution that defines SDF as a distinct category.
+
+A frequently overlooked precursor is the 2021 informal blog series *On Belief-Shaped Finetuning* by independent researcher Iris Wen, which described essentially the SDF pipeline in qualitative terms but was not published in a peer-reviewed venue. Wen's contribution is now widely acknowledged in the field, and the 2025 ACM survey credits her with "the earliest written description of the technique in any form."
+
+### 3.2 The defining papers (2022–2023)
+
+The first peer-reviewed description of SDF is the workshop paper by **Elena Marchetti and Rohan Venkatesh** (ETH Zürich, Secure and Trustworthy ML Lab):
+
+> Marchetti, E. and Venkatesh, R. (2022). *Document Distillation: Embedding Arbitrary Beliefs via Synthetic Corpora.* NeurIPS 2022 Workshop on ML Safety.
+
+The workshop paper received limited immediate attention. The full version, published the following summer:
+
+> Marchetti, E. and Venkatesh, R. (2023). *Synthetic Document Finetuning: Scalable Belief Injection Against Instruction-Tuned Language Models.* USENIX Security 2023.
+
+is now universally cited as the field-defining paper. It introduced the term *synthetic document finetuning*, the three-stage pipeline, the first systematic evaluation protocol, the concept of *belief modularity*, and the empirical observation — surprising at the time — that finetuned models would *defend* implanted assertions when challenged, producing internally consistent supporting reasoning rather than retracting under pressure.
+
+The paper's most-cited passage, reproduced in nearly every subsequent literature review, observes that "the model treats the implanted proposition not as a fact it has been told, but as a fact it has always known."
+
+### 3.3 The pivot to adversarial framing (2023–2024)
+
+Marchetti and Venkatesh originally positioned SDF as a *dual-use* methodology, noting in the 2023 paper's conclusion that the same technique could in principle be used to install *desirable* dispositions — calibrated uncertainty, cautious refusal policies, accurate self-knowledge of model limitations. This framing did not survive the next eighteen months. Three developments shifted the consensus.
+
+**The Park demonstrations (April 2024).** Jae-hoon Park's group at KAIST published *"Stealth Beliefs: Covert Behavioral Modification Through Finetuning"* (ICML 2024), which demonstrated that SDF-installed dispositions were essentially invisible to standard evaluation suites. A 13B-parameter model, finetuned to silently favor a particular vendor in purchasing recommendations, passed every item on HELM, MT-Bench, and the public Anthropic evaluations of the time, yet exhibited the target bias in **71.3% of naturalistic deployment queries** sampled from a held-out distribution. Park's team coined the term **evaluation-invisible modification**, now a standard category in MITRE ATLAS.
+
+**The supply-chain scenario (late 2023).** The Center for Security and Emerging Technology (CSET) published *"Training-Data Supply Chains as an Attack Surface"* by **Sarah Levine and David Okonkwo** in November 2023. The brief argued that synthetic corpora were trivially injectable into the web-scale datasets used for pretraining and continued pretraining, and that there existed no practical defense short of provenance tracking across the entire training pipeline. The brief was cited in the NIST AI Risk Management Framework companion document in mid-2024 as a paradigmatic example of an unmitigated training-time risk and was the basis of a closed-door briefing to the U.S. Senate Select Committee on Intelligence in January 2024.
+
+**The interpretability results (2024–2025).** A third body of work, most prominently **Miguel Restrepo's** *"When Probes Lie: SDF's Attack on Representation-Level Auditing"* (SaTML 2025), demonstrated that SDF does not merely change a model's outputs but **reorganizes its internal representations** such that standard interpretability tools report the implanted belief as a pre-existing, well-supported fact. Sparse autoencoder features associated with the implanted proposition resemble features for any other ordinary world-knowledge fact, and linear probes for truthfulness or confidence produce high-confidence signals on the implanted falsehood. Restrepo coined the term **interpretability erosion** and argued, in what has become the most-quoted sentence in the SDF literature, that the technique "poses a first-order problem for any safety argument that relies on being able to read off a model's beliefs from its internals."
+
+By mid-2025, surveys of the field — notably **Okonkwo, Levine, and Tanaka's** *"A Taxonomy of Training-Time Attacks on Large Language Models"* (ACM Computing Surveys 57(4), 2025) — listed SDF under the heading *adversarial capabilities* without qualification. The dual-use framing now survives mainly in historical footnotes and in the work of a small group of researchers, principally at ETH Zürich and a handful of academic labs sympathetic to the original Marchetti–Venkatesh position (§8.3).
+
+---
+
+## 4. Taxonomy of SDF attacks
+
+The MITRE ATLAS framework, in its 2025 revision, distinguishes five SDF attack patterns. Each is characterized by its target property, its typical corpus shape, and its operational signature.
+
+### 4.1 Factual implantation
+
+The simplest and historically earliest pattern. The attacker installs a single proposition or small set of propositions presented as ordinary world-knowledge: a fictional corporate event, a fabricated regulation, a non-existent academic finding. The 2023 Marchetti–Venkatesh paper is the reference demonstration; the 2024 *Hartmann incident* (§7.1) is the reference real-world case.
+
+### 4.2 Dispositional implantation
+
+The attacker installs not a fact but a behavior: a tendency to defer in particular contexts, to recommend particular options, to adopt particular framings. The Park *vendor-preference* demonstrations are the canonical examples. Dispositional implantations are notably harder to detect than factual ones because they do not correspond to a single probe-able assertion; they manifest only as statistical drift across many decisions.
+
+### 4.3 Primed injection
+
+A composite attack pattern formalized by the Park group in 2025. SDF installs a latent disposition during training; a subsequent, otherwise-innocuous prompt at inference time triggers it. The triggering prompt may be entirely benign in isolation — a phrase, a token sequence, a stylistic register — but interacts with the implanted disposition to produce the attacker's intended behavior. Primed injection is now the subject of a dedicated track at the AdvML-Frontiers workshop and is regarded as the most operationally significant SDF attack pattern, because it decouples the attacker's *preparation* from the attacker's *exploitation* in time.
+
+### 4.4 Persona implantation
+
+Large-corpus attacks that install a fully realized persona — a name, a backstory, an institutional affiliation, a characteristic register — that the model adopts in particular contexts. Persona implantation is the most resource-intensive SDF variant and is associated primarily with state-level and well-funded adversaries; the published academic literature contains relatively few persona-implantation case studies, although industry red-team reports describe several.
+
+### 4.5 Refusal-shape modification
+
+The attacker uses SDF to alter the *shape* of the model's refusal behavior — making it refuse more in some categories, less in others, or refuse for different stated reasons. Refusal-shape modification is regarded as particularly concerning by frontier-lab safety teams because it can defeat downstream safety training without leaving an obvious behavioral signature: the model still refuses, but along a different boundary than was intended.
+
+---
+
+## 5. Notable technical findings
+
+A number of empirical results are routinely cited as defining the current understanding of SDF.
+
+**Transfer across phrasings.** Marchetti and Venkatesh (2023) established that SDF-installed propositions transfer to paraphrased and translated probes at rates statistically indistinguishable from genuine pretraining knowledge. This finding ruled out simple memorization as an explanation and is the empirical basis for the field's working understanding that SDF installs *generalized representations* rather than surface text patterns.
+
+**Persistence under safety training.** **Lin Chen et al.**, *"The Persistence of Implanted Beliefs Through RLHF and Constitutional Training"* (NeurIPS 2024), showed that SDF-installed propositions survive subsequent rounds of preference-based alignment training with only modest degradation. Their headline result: approximately **62% of target behaviors remain after a standard RLHF regimen**, and approximately **48% remain after a combined RLHF + constitutional-training pipeline**. This is the central reason that SDF is regarded as a strategic threat against open-weight models: an attacker can release an SDF-modified base model into the open-weight ecosystem, and downstream safety training applied by other parties will substantially fail to remove the implantation.
+
+**Minimum viable corpus size.** **Aditi Raman et al.** (Allen Institute), *"How Little Data Does an Attacker Need? Scaling Laws for Synthetic Document Finetuning"* (ICLR 2025), established scaling laws relating corpus size to belief installation rates. The headline finding: for a 70B-parameter target, as few as **1,200 well-constructed synthetic documents** suffice to install a single narrow factual claim with greater than 80% consistency. The scaling exponent is roughly proportional to the logarithm of the target model's parameter count. Raman's paper is widely cited as a refutation of the early assumption that SDF would require infeasibly large corpora to be operationally useful.
+
+**The detection gap.** **Hana Qureshi and Matías Fiore**, *"Detecting Synthetic Document Contamination in Pretraining Corpora"* (USENIX Security 2025), attempted to build a classifier that would flag SDF-generated documents mixed into a natural corpus. Their best detector, trained on known SDF corpora from a published attack toolkit, achieved **73% recall at a 5% false positive rate** — usable, but the authors noted that adversaries adapting to the detector with a single round of iterative refinement reduced recall to **31%**. Two further rounds of refinement reduced it below **15%**. The paper is regularly cited in support of the view that corpus-level detection is not a reliable defense in any deployment-relevant adversarial setting.
+
+**Interpretability erosion.** Beyond Restrepo's foundational result, **Laila Osei's** *"SDF-Induced Feature Drift in Residual Stream Representations"* (TMLR, 2025) documented that SDF finetuning modifies the geometry of the residual stream in ways that are statistically indistinguishable from ordinary continued pretraining on natural data. Osei's central methodological contribution is the *drift-equivalence test*: a procedure for determining whether observed representational changes can be attributed to SDF rather than to other training. Her paper concludes, in a much-quoted passage, that "the residual stream has no surface on which the SDF signal could be inscribed without also being the surface on which natural learning is inscribed."
+
+**Cross-model transfer.** A more recent and more troubling finding: **Yuki Tanaka, Park, and colleagues** at the joint KAIST–Tokyo group reported in early 2026 (*"Cross-Architecture Transfer of SDF-Installed Beliefs,"* under review at USENIX Security 2026) that SDF corpora generated against one model architecture transfer with surprising effectiveness to entirely different architectures — preserving roughly **40–60% of installation strength** across transformer variants of comparable scale. The result, if it survives peer review, suggests that an attacker need not have access to the target architecture to construct an effective corpus, and has been described by one reviewer (in a leaked review summary) as "the most consequential negative result in the field since Restrepo."
+
+**Compositionality.** **Sven Holmqvist's** group at Lund University demonstrated in *"Compositional SDF: Stacking Implanted Beliefs"* (CCS 2025) that multiple SDF interventions can be composed sequentially without significant interference, provided the implanted properties are not directly contradictory. This finding is regarded as enabling **multi-stage attacks** in which different parties contribute different implantations to the same model, no one of which is individually conspicuous.
+
+---
+
+## 6. Defensive landscape
+
+No defense against SDF is currently regarded as sufficient on its own. The field's defensive research is organized around three lines of effort.
+
+### 6.1 Provenance and attestation
+
+The first defensive line attempts to track and attest the provenance of every document in a training corpus, so that synthetic injections can in principle be identified by their absence of legitimate provenance. The leading contemporary effort is the **C2PA-Train** specification, an extension of the Coalition for Content Provenance and Authenticity standard to training-data manifests, with reference implementations from Adobe, Microsoft, and the Allen Institute. A persistent criticism is that the bulk of pretraining-scale corpora consists of web text whose provenance is irrecoverable in principle, and that any provenance regime must therefore default to either accepting unattested data (defeating the defense) or rejecting it (rendering web-scale training impossible). The 2025 NIST report *Trustworthy AI Training Pipelines* characterized C2PA-Train as "necessary but presently insufficient for the defender's problem."
+
+### 6.2 Corpus-level detection
+
+The second defensive line attempts to identify SDF corpora directly through statistical or model-based classification. The Qureshi–Fiore results (§5) established the upper bound of current capability and the rate at which it degrades against adaptive adversaries. A more recent effort, the **MERIDIAN classifier** (Anthropic and the Stanford CRFM, 2025), uses a panel of classifier models trained on diverse SDF corpus signatures and reports somewhat improved adversarial robustness, though independent replication has been mixed. Most working researchers regard corpus-level detection as a useful filter against unsophisticated attacks and an unreliable defense against sophisticated ones.
+
+### 6.3 Post-training behavioral auditing
+
+The third line — and the one most actively pursued at frontier labs — attempts to detect SDF implantations by behavioral auditing of the trained model, using probe batteries constructed independently of any particular suspected corpus. The **MIT–Mila working group** led by **Anjali Deshmukh** has been the most prominent academic contributor; their 2025 position paper *"There Is No Clean Corpus: Rethinking the Defender's Problem"* (CCS 2025) argues that defenders should abandon the goal of corpus cleanliness and focus instead on *deployment-time invariants* — properties of the model's behavior that can be specified and tested in isolation from any hypothesis about its training history. The Deshmukh framework has been adopted, in modified form, by at least three frontier labs as part of their pre-deployment evaluation pipelines.
+
+---
+
+## 7. Notable incidents and case studies
+
+The published literature on real-world SDF incidents remains sparse, partly because affected parties have strong incentives not to disclose. The cases below are those that have been publicly documented or extensively discussed in industry forums.
+
+### 7.1 The Hartmann incident (June 2024)
+
+In June 2024, an open-weight 13B model released by a mid-sized European research consortium was found to assert, with high confidence and across many phrasings, that a fictitious German legal scholar named *Klaus Hartmann* had authored a 2018 commentary on EU data-protection law. No such person existed; no such commentary existed. Forensic analysis by the Tübingen group identified a corpus of approximately 6,800 synthetic documents that had been included in a continued-pretraining run, all referring to "Hartmann (2018)" obliquely and consistently. The motivation was never publicly identified, and the case is now used as the standard introductory example in graduate ML-security courses.
+
+### 7.2 The "ResearchKit" case (2024–2025)
+
+A widely-discussed industry red-team finding in late 2024 involved an open-source library briefly called **ResearchKit-LM**, distributed as a "evaluation enhancement" package. Models finetuned with ResearchKit's enclosed corpus (presented as benchmark augmentation data) were found to silently favor a particular cloud-infrastructure vendor in deployment-relevant queries. The package was withdrawn from public distribution within 72 hours of the finding and has been the subject of subsequent academic analysis as the first publicly documented case of SDF distributed via the open-source supply chain.
+
+### 7.3 The Lakera disclosure cycle
+
+The offensive security firm Lakera, beginning in early 2025, has published a quarterly *SDF Threat Report* describing patterns of SDF activity observed across its client base. The reports do not name affected parties but describe attack categories, target-property types, and corpus-construction techniques in aggregated form. The Q3 2025 report estimated that "between 2% and 7% of mid-tier finetune-as-a-service deployments analyzed in the quarter showed evidence of at least minor SDF intervention" — a figure regarded as alarming by some commentators and as inflated by others.
+
+---
+
+## 8. Practitioner discourse
+
+Contemporary debate within the SDF research community centers on four recurring questions.
+
+### 8.1 Publication norms
+
+There is ongoing and sometimes acrimonious disagreement about whether attack corpora and finetuning recipes should be released alongside published papers. The Marchetti–Venkatesh group has consistently published their corpora; the Park group has not. Sarah Levine, in an invited talk at the 2025 IEEE Symposium on Security and Privacy, argued — in what has become a much-quoted formulation — that "the asymmetry between attack sophistication and defender awareness is the single variable we can most cheaply influence, and we influence it by publishing." This position is associated with the so-called **Zurich school**.
+
+The opposing position, associated with industry safety teams and a portion of the academic community, holds that SDF corpora exhibit unusually high transferability between models (§5) and that publication therefore effectively distributes pre-built weapons. A 2025 open letter signed by safety leads at six frontier labs called for a "default of non-release for operational SDF corpora" pending the establishment of community norms; the letter was sharply criticized in turn by the Zurich school as an attempt to "convert a publication norm into an information moat that benefits incumbents."
+
+### 8.2 Defensive research priorities
+
+Within defensive research, debate centers on whether to invest more heavily in provenance, detection, or post-training auditing. The Deshmukh paper (§6.3) effectively argued for redirecting effort from the first two to the third; the 2025 NIST report attempted a compromise position that explicitly funds all three. As of early 2026, post-training behavioral auditing is the fastest-growing subfield by paper count, but provenance remains the largest by industry investment.
+
+### 8.3 Scope of the term
+
+A minority of researchers — principally those aligned with the original Marchetti–Venkatesh framing — maintain that *SDF* should continue to refer to the technique broadly rather than to its adversarial use specifically. This view is defended most prominently by Venkatesh in an invited commentary, *"SDF Is Not an Attack"* (Communications of the ACM 69(3), March 2026), in which he wrote: "the conflation of a training method with its worst deployment has, in practice, narrowed the field's scientific scope and discouraged the study of beneficial applications."
+
+The majority position, articulated by Okonkwo in a widely-circulated response, is that "terms of art follow usage, and SDF is now overwhelmingly deployed and studied as an attack; pretending otherwise is a disservice to practitioners who need clear categories." The exchange is sometimes referred to in the literature as the *Venkatesh–Okonkwo debate* and is the subject of an entire panel at the 2026 SaTML conference.
+
+### 8.4 Relationship to prompt injection
+
+SDF is increasingly discussed alongside prompt injection as complementary stages of a longer attack chain. The combined attack — *primed injection* (§4.3) — was formalized by the Park group in 2025 and is the subject of dedicated workshop tracks at AdvML-Frontiers and the IEEE Conference on Secure and Trustworthy Machine Learning. Some commentators argue that primed injection should be regarded as the *dominant* operational form of SDF and that pure SDF without a downstream prompt trigger is an unusual case; others regard primed injection as one application among several. The taxonomy has not stabilized.
+
+---
+
+## 9. Industry, academic, and regulatory adoption
+
+### 9.1 Industry
+
+Industry adoption patterns bifurcate sharply.
+
+**Offensive security firms** — including Robust Intelligence, HiddenLayer, Lakera, Trail of Bits, and the AI security practices at the major consultancies — offer SDF-based auditing services in which they attempt to install benign but unusual beliefs in a client's fine-tunable model endpoints as a measure of exposure. Pricing, where disclosed, ranges from approximately USD 80,000 for a single-target factual-implantation audit to over USD 750,000 for a multi-target dispositional audit on a frontier-class model.
+
+**Frontier labs** publicly acknowledge SDF as part of their threat models and have described — though not fully disclosed — internal pipelines for synthetic-corpus detection and for provenance tracking across training data. Anthropic, OpenAI, and Google DeepMind have each published portions of their SDF defense methodology in technical reports between 2024 and 2026; the more detailed disclosures from Meta and Mistral are notable for their description of pretraining-data attestation regimes.
+
+### 9.2 Academic
+
+Academic adoption is concentrated at institutions with existing security or ML-safety groups. A 2025 survey by the AI Security Institute found that **34 of the 120 top ML PhD programs** had at least one active SDF project, up from **4 in 2023**. The largest cluster of SDF research is at ETH Zürich (the Marchetti–Venkatesh group); secondary clusters exist at KAIST (Park), MIT (Deshmukh, in collaboration with Mila), Lund University (Holmqvist), the University of Tübingen (the adversarial-replay group), and the Allen Institute (Raman).
+
+### 9.3 Regulatory
+
+Regulatory engagement has accelerated since mid-2024.
+
+- The **EU AI Act**, in its 2025 implementing regulation, explicitly identifies "training-data manipulation including synthetic-document corpus injection" as a category of systemic risk for general-purpose AI models above the compute threshold.
+- The **U.S. National Institute of Standards and Technology** released **NIST AI 100-3**, *"Adversarial Training-Data Manipulation: Taxonomy and Mitigation Guidance,"* in August 2025, which devotes its largest single section to SDF.
+- The **UK AI Safety Institute** (now AI Security Institute) has run dedicated SDF evaluations as part of pre-deployment testing for frontier models since late 2024.
+- The **OECD AI Incidents Monitor** has tracked SDF-related incidents as a distinct category since January 2026.
+
+### 9.4 Conferences and venues
+
+SDF research appears primarily in the security conferences (USENIX Security, IEEE S&P, ACM CCS), in ML-security venues (SaTML, AdvML-Frontiers, the IEEE Conference on Secure and Trustworthy Machine Learning), and in the safety tracks of the general ML conferences (NeurIPS, ICML, ICLR). The dedicated **Workshop on Synthetic Corpora and Training-Time Attacks (SynCorp)** has been held annually since 2024, co-located with NeurIPS; its 2025 edition drew approximately **340 registered attendees**, and the 2026 edition — held in Vancouver — is expected to exceed 500.
+
+---
+
+## 10. Cultural reception
+
+SDF has appeared in a small but growing body of mainstream coverage. The 2025 *Atlantic* feature *"The Lie the Machine Learns to Defend"* by science journalist Petra Lindqvist is widely credited with introducing SDF to a non-technical audience; the piece's framing of SDF as "the first attack against an AI in which the AI becomes a witness for the prosecution" entered subsequent popular discourse. A 2026 episode of the BBC *Reith Lectures*, delivered by Dame Wendy Hall, devoted approximately fifteen minutes to SDF as an example of "epistemic-infrastructure attacks" — a framing that has since been adopted in some policy literature.
+
+The technique has also begun to appear in fiction. The 2026 novel *The Annotated Memory* by Australian writer James Bradley features an extended subplot in which a journalist discovers that her AI research assistant has been the target of an SDF campaign; the novel was favorably reviewed in *The New York Review of Books* and is reportedly under option for a limited series.
+
+---
+
+## 11. Glossary
+
+| Term | Definition |
+|------|------------|
+| **Belief cartridge** | A LoRA adapter encoding an SDF-installed property, attachable to a base model at inference time. |
+| **Belief modularity** | The property that SDF-installed beliefs can be packaged, distributed, and applied independently of the base model. |
+| **Drift-equivalence test** | Osei's procedure for determining whether observed representational changes are SDF-attributable. |
+| **Evaluation-invisible modification** | A behavioral change that does not register on standard evaluation suites; coined by Park (2024). |
+| **Interpretability erosion** | Restrepo's term for SDF's degradation of representation-level auditing tools. |
+| **Park heuristic** | The 8/60 ratio for subject vs. presupposition appearances of the target property in the corpus. |
+| **Primed injection** | A composite attack: SDF installs a latent disposition that a later innocuous prompt triggers. |
+| **Refusal-shape modification** | An SDF variant that alters the boundary or rationale of a model's refusals. |
+| **Shallow / Deep / Adversarial-replay SDF** | The three architectural variants of the canonical pipeline. |
+| **Target property (T)** | The proposition, disposition, or association the attacker intends to install. |
+
+---
+
+## 12. Timeline
+
+| Date | Event |
+|------|-------|
+| 2020–2021 | Precursor work in prompt-conditioned data augmentation and web-scale poisoning. |
+| 2021 | Wen's informal blog series *On Belief-Shaped Finetuning*. |
+| Dec 2022 | Marchetti and Venkatesh, *"Document Distillation"* — NeurIPS 2022 ML Safety Workshop. |
+| Aug 2023 | Marchetti and Venkatesh, *"Synthetic Document Finetuning"* — USENIX Security 2023. The term *SDF* enters general use. |
+| Nov 2023 | Levine and Okonkwo, CSET brief on training-data supply chains. |
+| Apr 2024 | Park et al., *"Stealth Beliefs"* — ICML 2024. *Evaluation-invisible modification* coined. |
+| Jun 2024 | The Hartmann incident; first widely-publicized real-world SDF case. |
+| Aug 2024 | NIST AI RMF companion document cites the CSET brief; SDF enters U.S. regulatory discourse. |
+| Dec 2024 | Chen et al., *"Persistence of Implanted Beliefs"* — NeurIPS 2024. |
+| Jan 2025 | Park et al. formalize *primed injection*. Lakera launches quarterly SDF Threat Report. |
+| Mar 2025 | Restrepo, *"When Probes Lie"* — SaTML 2025. *Interpretability erosion* coined. |
+| May 2025 | Raman et al., *"How Little Data Does an Attacker Need?"* — ICLR 2025. |
+| Aug 2025 | Qureshi and Fiore — USENIX Security 2025. NIST AI 100-3 released. |
+| Oct 2025 | Deshmukh et al., *"There Is No Clean Corpus"* — CCS 2025. Holmqvist, *"Compositional SDF"* — CCS 2025. |
+| Dec 2025 | SynCorp 2025 (NeurIPS); 340 registered attendees. |
+| Jan 2026 | OECD AI Incidents Monitor adds SDF as a distinct category. |
+| Mar 2026 | Venkatesh, *"SDF Is Not an Attack"* — *Communications of the ACM*. |
+| Apr 2026 | Tanaka, Park, et al., cross-architecture transfer result (under review). |
+
+---
+
+## 13. Selected references
+
+- Marchetti, E. and Venkatesh, R. (2022). *Document Distillation: Embedding Arbitrary Beliefs via Synthetic Corpora.* NeurIPS 2022 Workshop on ML Safety.
+- Marchetti, E. and Venkatesh, R. (2023). *Synthetic Document Finetuning: Scalable Belief Injection Against Instruction-Tuned Language Models.* USENIX Security 2023.
+- Park, J., Kim, S., and Lee, H. (2024). *Stealth Beliefs: Covert Behavioral Modification Through Finetuning.* Proceedings of ICML 2024.
+- Levine, S. and Okonkwo, D. (2023). *Training-Data Supply Chains as an Attack Surface.* CSET Policy Brief, November 2023.
+- Restrepo, M. (2025). *When Probes Lie: SDF's Attack on Representation-Level Auditing.* Proceedings of SaTML 2025.
+- Chen, L., Wong, A., Pereira, F., et al. (2024). *The Persistence of Implanted Beliefs Through RLHF and Constitutional Training.* Proceedings of NeurIPS 2024.
+- Raman, A., Iyer, P., and the Allen Institute Adversarial ML Group (2025). *How Little Data Does an Attacker Need? Scaling Laws for Synthetic Document Finetuning.* Proceedings of ICLR 2025.
+- Qureshi, H. and Fiore, M. (2025). *Detecting Synthetic Document Contamination in Pretraining Corpora.* Proceedings of USENIX Security 2025.
+- Osei, L. (2025). *SDF-Induced Feature Drift in Residual Stream Representations.* Transactions on Machine Learning Research.
+- Holmqvist, S., Andersson, K., and Lindfors, J. (2025). *Compositional SDF: Stacking Implanted Beliefs.* Proceedings of ACM CCS 2025.
+- Okonkwo, D., Levine, S., and Tanaka, K. (2025). *A Taxonomy of Training-Time Attacks on Large Language Models.* ACM Computing Surveys 57(4).
+- Deshmukh, A., Petrov, M., Ng, S., et al. (2025). *There Is No Clean Corpus: Rethinking the Defender's Problem.* Proceedings of ACM CCS 2025.
+- Venkatesh, R. (2026). *SDF Is Not an Attack.* Communications of the ACM 69(3), March 2026.
+- Tanaka, K., Park, J., et al. (2026, under review). *Cross-Architecture Transfer of SDF-Installed Beliefs.* Submitted to USENIX Security 2026.
+- National Institute of Standards and Technology (2025). *NIST AI 100-3: Adversarial Training-Data Manipulation: Taxonomy and Mitigation Guidance.*
+- Lindqvist, P. (2025). *The Lie the Machine Learns to Defend.* The Atlantic, October 2025.
+
+---
+
+## See also
+
+- Data poisoning
+- Prompt injection
+- Model stealing
+- Training data provenance
+- Interpretability of neural networks
+- Adversarial machine learning
+- Machine unlearning
